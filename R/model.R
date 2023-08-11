@@ -188,6 +188,7 @@ cmdstan_model <- function(stan_file = NULL, exe_file = NULL, compile = TRUE, ...
 #'  [`$exe_file()`][model-method-compile] |  Return the file path to the compiled executable. |
 #'  [`$hpp_file()`][model-method-compile] |  Return the file path to the `.hpp` file containing the generated C++ code. |
 #'  [`$save_hpp_file()`][model-method-compile] |  Save the `.hpp` file containing the generated C++ code. |
+#'  [`$expose_functions()`][model-method-expose_functions] |  Expose Stan functions for use in R. |
 #'
 #'  ## Model fitting
 #'
@@ -325,10 +326,6 @@ CmdStanModel <- R6::R6Class(
               "- ", new_hpp_loc)
       private$hpp_file_ <- new_hpp_loc
       invisible(private$hpp_file_)
-    },
-    expose_functions = function(global = FALSE, verbose = FALSE) {
-      expose_functions(self$functions, global, verbose)
-      invisible(NULL)
     }
   )
 )
@@ -391,10 +388,16 @@ CmdStanModel <- R6::R6Class(
 #'   not modified since last compiled. The default is `FALSE`. Can also be set
 #'   via a global `cmdstanr_force_recompile` option.
 #' @param compile_model_methods (logical) Compile additional model methods
-#'   (`log_prob()`, `grad_log_prob()`, `constrain_pars()`, `unconstrain_pars()`)
+#'   (`log_prob()`, `grad_log_prob()`, `constrain_variables()`,
+#'   `unconstrain_variables()`).
 #' @param compile_hessian_method (logical) Should the (experimental) `hessian()` method be
 #'   be compiled with the model methods?
-#' @param compile_standalone (logical) Should functions in the Stan model be compiled for used in R?
+#' @param compile_standalone (logical) Should functions in the Stan model be
+#'   compiled for use in R? If `TRUE` the functions will be available via the
+#'   `functions` field in the compiled model object. This can also be done after
+#'   compilation using the
+#'   [`$expose_functions()`][model-method-expose_functions] method.
+#'
 #' @param threads Deprecated and will be removed in a future release. Please
 #'   turn on threading via `cpp_options = list(stan_threads = TRUE)` instead.
 #'
@@ -584,7 +587,7 @@ compile <- function(quiet = TRUE,
   self$functions$hpp_code <- get_standalone_hpp(temp_stan_file, stancflags_standalone)
   self$functions$external <- !is.null(user_header)
   if (compile_standalone) {
-    expose_functions(self$functions, !quiet)
+    expose_stan_functions(self$functions, !quiet)
   }
   stancflags_val <- paste0("STANCFLAGS += ", stancflags_val, paste0(" ", stancflags_combined, collapse = " "))
   withr::with_path(
@@ -657,7 +660,7 @@ compile <- function(quiet = TRUE,
   private$precompile_stanc_options_ <- NULL
   private$precompile_include_paths_ <- NULL
   private$model_methods_env_ <- new.env()
-  private$model_methods_env_$hpp_code_ <- readLines(private$hpp_file_, warn = FALSE)
+  suppressWarnings(private$model_methods_env_$hpp_code_ <- readLines(private$hpp_file_, warn = FALSE))
   if (compile_model_methods) {
     expose_model_methods(env = private$model_methods_env_,
                           verbose = !quiet,
@@ -784,8 +787,8 @@ check_syntax <- function(pedantic = FALSE,
   if (length(stanc_options) == 0 && !is.null(private$precompile_stanc_options_)) {
     stanc_options <- private$precompile_stanc_options_
   }
-  if (is.null(include_paths) && !is.null(private$precompile_include_paths_)) {
-    include_paths <- private$precompile_include_paths_
+  if (is.null(include_paths) && !is.null(self$include_paths())) {
+    include_paths <- self$include_paths()
   }
 
   temp_hpp_file <- tempfile(pattern = "model-", fileext = ".hpp")
@@ -922,7 +925,7 @@ format <- function(overwrite_file = FALSE,
     lower = 1, len = 1, null.ok = TRUE
   )
   stanc_options <- private$precompile_stanc_options_
-  stancflags_val <- include_paths_stanc3_args(private$precompile_include_paths_)
+  stancflags_val <- include_paths_stanc3_args(self$include_paths())
   stanc_options["auto-format"] <- TRUE
   if (!is.null(max_line_length)) {
     stanc_options["max-line-length"] <- max_line_length
@@ -1343,23 +1346,17 @@ CmdStanModel$set("public", name = "sample_mpi", value = sample_mpi)
 #' @family CmdStanModel methods
 #'
 #' @description The `$optimize()` method of a [`CmdStanModel`] object runs
-#'   Stan's optimizer to obtain a posterior mode (penalized maximum likelihood)
-#'   estimate.
+#'   Stan's optimizer to obtain a (penalized) maximum likelihood estimate or a
+#'   maximum a posteriori estimate (if `jacobian=TRUE`). See the
+#'   [Maximum Likelihood Estimation](https://mc-stan.org/docs/cmdstan-guide/maximum-likelihood-estimation.html)
+#'   section of the CmdStan User's Guide for more details.
 #'
 #'   Any argument left as `NULL` will default to the default value used by the
-#'   installed version of CmdStan. See the
-#'   [CmdStan User’s Guide](https://mc-stan.org/docs/cmdstan-guide/)
-#'   for more details.
-#'
-#' @details CmdStan can find the posterior mode (assuming there is one). If the
-#'   posterior is not convex, there is no guarantee Stan will be able to find
-#'   the global mode as opposed to a local optimum of log probability. For
-#'   optimization, the mode is calculated without the Jacobian adjustment for
-#'   constrained variables, which shifts the mode due to the change of
-#'   variables. Thus modes correspond to modes of the model as written.
-#'
-#'   -- [*CmdStan User's Guide*](https://mc-stan.org/docs/cmdstan-guide/)
-#'
+#'   installed version of CmdStan. See the [CmdStan User’s
+#'   Guide](https://mc-stan.org/docs/cmdstan-guide/) for more details on the
+#'   default arguments. The default values can also be obtained by checking the
+#'   metadata of an example model, e.g.,
+#'   `cmdstanr_example(method="optimize")$metadata()`.
 #' @template model-common-args
 #' @param threads (positive integer) If the model was
 #'   [compiled][model-method-compile] with threading support, the number of
@@ -1371,6 +1368,12 @@ CmdStanModel$set("public", name = "sample_mpi", value = sample_mpi)
 #'   for `"lbfgs"` and `"bfgs`. For their default values and more details see
 #'   the CmdStan User's Guide. The default values can also be obtained by
 #'   running `cmdstanr_example(method="optimize")$metadata()`.
+#' @param jacobian (logical) Whether or not to use the Jacobian adjustment for
+#'   constrained variables. By default this is `FALSE`, meaning optimization
+#'   yields the (regularized) maximum likelihood estimate. Setting it to `TRUE`
+#'   yields the maximum a posteriori estimate. See the
+#'   [Maximum Likelihood Estimation](https://mc-stan.org/docs/cmdstan-guide/maximum-likelihood-estimation.html)
+#'   section of the CmdStan User's Guide for more details.
 #' @param init_alpha (positive real) The initial step size parameter.
 #' @param tol_obj (positive real) Convergence tolerance on changes in objective function value.
 #' @param tol_rel_obj (positive real) Convergence tolerance on relative changes in objective function value.
@@ -1396,6 +1399,7 @@ optimize <- function(data = NULL,
                      threads = NULL,
                      opencl_ids = NULL,
                      algorithm = NULL,
+                     jacobian = FALSE,
                      init_alpha = NULL,
                      iter = NULL,
                      tol_obj = NULL,
@@ -1415,6 +1419,7 @@ optimize <- function(data = NULL,
   }
   optimize_args <- OptimizeArgs$new(
     algorithm = algorithm,
+    jacobian = jacobian,
     init_alpha = init_alpha,
     iter = iter,
     tol_obj = tol_obj,
@@ -1748,6 +1753,63 @@ diagnose <- function(data = NULL,
   CmdStanDiagnose$new(runset)
 }
 CmdStanModel$set("public", name = "diagnose", value = diagnose)
+
+#' Expose Stan functions to R
+#'
+#' @name model-method-expose_functions
+#' @aliases expose_functions fit-method-expose_functions
+#' @family CmdStanModel methods
+#'
+#' @description The `$expose_functions()` method of a [`CmdStanModel`] object
+#'   will compile the functions in the Stan program's `functions` block and
+#'   expose them for use in \R. This can also be specified via the
+#'   `compile_standalone` argument to the [`$compile()`][model-method-compile]
+#'   method.
+#'
+#'   This method is also available for fitted model objects ([`CmdStanMCMC`], [`CmdStanVB`], etc.).
+#'   See **Examples**.
+#'
+#'   Note: there may be many compiler warnings emitted during compilation but
+#'   these can be ignored so long as they are warnings and not errors.
+#'
+#' @param global (logical) Should the functions be added to the Global
+#'   Environment? The default is `FALSE`, in which case the functions are
+#'   available via the `functions` field of the R6 object.
+#' @param verbose (logical) Should detailed information about generated code be
+#'   printed to the console? Defaults to `FALSE`.
+#' @template seealso-docs
+#' @examples
+#' \dontrun{
+#' stan_file <- write_stan_file(
+#'  "
+#'  functions {
+#'    real a_plus_b(real a, real b) {
+#'      return a + b;
+#'    }
+#'  }
+#'  parameters {
+#'    real x;
+#'  }
+#'  model {
+#'    x ~ std_normal();
+#'  }
+#'  "
+#' )
+#' mod <- cmdstan_model(stan_file)
+#' mod$expose_functions()
+#' mod$functions$a_plus_b(1, 2)
+#'
+#' fit <- mod$sample(refresh = 0)
+#' fit$expose_functions() # already compiled because of above but this would compile them otherwise
+#' fit$functions$a_plus_b(1, 2)
+#' }
+#'
+#'
+expose_functions = function(global = FALSE, verbose = FALSE) {
+  expose_stan_functions(self$functions, global, verbose)
+  invisible(NULL)
+}
+CmdStanModel$set("public", name = "expose_functions", value = expose_functions)
 
 
 
